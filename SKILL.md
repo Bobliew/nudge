@@ -61,28 +61,41 @@ gh repo list --source --no-archived --json name,owner,description,pushedAt,starg
 
 Read previous state and feedback:
 ```bash
-cat ~/.nudge/state.json 2>/dev/null || echo '{"runs":[]}'
-cat ~/.nudge/feedback.json 2>/dev/null || echo '{"repos":{}}'
+cat ~/.nudge/state.json 2>/dev/null || echo '{"schemaVersion":1,"runs":[]}'
+cat ~/.nudge/feedback.json 2>/dev/null || echo '{"schemaVersion":1,"repos":{},"excluded":[]}'
 ```
 
-Present repos grouped by activity:
+**Score each repo using `references/scoring.md`.** Read that file and apply the
+signals mechanically — recent push window, open community issues, exclusion
+list, and prior-run cooldown. Do not override scores with LLM judgment.
+
+Present the top candidates ranked by score, with the signals that drove the
+score so the user can tell why each appears:
 
 ```
-Your repos (23 total):
+Your repos (23 total, showing top 5 by score):
 
-Recently active (< 3 months):
-  1. my-api — Python, pushed 5 days ago
-  2. web-app — TypeScript, pushed 2 weeks ago
+  1. cli-tool — Rust, pushed 4mo ago  [score: 9]
+     +5 open issue from @userX with no owner reply (#12)
+     +2 in sweet-spot push window (30–180d)
+     +2 3 open issues total
 
-Could use attention (3-12 months):
-  3. cli-tool — Rust, 4 months ago, 3 open issues
-  4. data-viz — Python, 8 months ago, 12 stars
+  2. data-viz — Python, pushed 8mo ago  [score: 6]
+     +3 new star in last 30 days
+     +1 in 180d–2y window
+     +2 12 stars, 1 open issue
 
-Hibernating (> 1 year):
-  5. old-project — Go, 14 months ago
+  3. my-api — Python, pushed 5d ago  [score: -5]
+     -5 too recently active; probably doesn't need a nudge
+
+  …
 
 Which repo(s) should I look at? (number, name, or "all")
 ```
+
+If all scores are ≤ 0, say so honestly: "All your projects look either very
+active or very old. No strong candidates this week — tell me a specific repo
+and I'll look anyway."
 
 ### Step 2 — Wait for user selection
 
@@ -90,48 +103,80 @@ The user picks one or more repos. Proceed with those.
 
 ### Step 3 — Deep read (per selected repo)
 
-Gather comprehensive context using `gh api`:
+Gather comprehensive context using `gh api`. Use `vnd.github.raw` where
+available to skip base64 decoding, and reuse the top-level contents listing
+to decide which manifest file to fetch (at most one extra request instead
+of four blind tries):
 
 ```bash
-# README (truncate to ~8KB)
-gh api repos/{owner}/{repo}/readme --jq '.content' | base64 -d | head -c 8000
+# README — raw bytes, truncate to ~8KB. Prefer `awk` (or `sed`) for UTF-8-safe
+# truncation; `head -c` slices bytes and can cut a multi-byte char in half.
+gh api repos/{owner}/{repo}/readme \
+  -H "Accept: application/vnd.github.raw" \
+  | awk 'total<8000 {print; total += length($0)+1}'
 
 # Last 15 commits (messages + dates)
-gh api repos/{owner}/{repo}/commits?per_page=15 --jq '.[] | {message: .commit.message, date: .commit.committer.date}'
+gh api repos/{owner}/{repo}/commits?per_page=15 \
+  --jq '.[] | {message: .commit.message, date: .commit.committer.date}'
 
 # Open issues with engagement signals
-gh api repos/{owner}/{repo}/issues?state=open --jq '.[] | {number, title, body: (.body // "" | .[0:500]), comments, reactions: .reactions.total_count}'
+gh api repos/{owner}/{repo}/issues?state=open \
+  --jq '.[] | {number, title, body: (.body // "" | .[0:500]), comments, reactions: .reactions.total_count}'
 
 # Recently closed issues (trajectory)
-gh api "repos/{owner}/{repo}/issues?state=closed&per_page=20" --jq '.[] | {number, title, labels: [.labels[].name], closed_at}'
+gh api "repos/{owner}/{repo}/issues?state=closed&per_page=20" \
+  --jq '.[] | {number, title, labels: [.labels[].name], closed_at}'
 
-# File tree (top level + one level deep)
-gh api repos/{owner}/{repo}/contents --jq '.[].name'
+# File tree (top level) — save the result; reuse it below to pick a manifest.
+tree_json=$(gh api repos/{owner}/{repo}/contents)
+echo "$tree_json" | jq -r '.[].name'
 
-# Manifest / config
-gh api repos/{owner}/{repo}/contents/package.json --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || \
-gh api repos/{owner}/{repo}/contents/pyproject.toml --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || \
-gh api repos/{owner}/{repo}/contents/Cargo.toml --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || \
-gh api repos/{owner}/{repo}/contents/go.mod --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || \
-echo "No manifest found"
+# Manifest / config — only fetch the first one that actually exists.
+manifest=$(echo "$tree_json" | jq -r '
+  [.[].name] as $files
+  | ["package.json","pyproject.toml","Cargo.toml","go.mod","Gemfile","pom.xml"]
+  | map(select(. as $f | $files | index($f)))
+  | .[0] // empty')
+if [ -n "$manifest" ]; then
+  gh api "repos/{owner}/{repo}/contents/$manifest" \
+    -H "Accept: application/vnd.github.raw"
+else
+  echo "No manifest found"
+fi
 
 # Releases
-gh api repos/{owner}/{repo}/releases --jq '.[0:5] | .[] | {tag: .tag_name, date: .published_at}'
+gh api repos/{owner}/{repo}/releases \
+  --jq '.[0:5] | .[] | {tag: .tag_name, date: .published_at}'
 
-# Recent stargazers (interest signal)
-gh api repos/{owner}/{repo}/stargazers -H "Accept: application/vnd.github.star+json" --jq '.[0:10] | .[] | .starred_at' 2>/dev/null
+# Early stargazers (first 10 people who starred — useful as a low-fidelity
+# interest signal). GitHub returns stargazers in chronological order starting
+# with the earliest, so `.[0:10]` gives the *oldest* stars, not the newest.
+# Grabbing "most recent" requires paging to the last page; skip that here.
+gh api repos/{owner}/{repo}/stargazers \
+  -H "Accept: application/vnd.github.star+json" \
+  --jq '.[0:10] | .[] | .starred_at' 2>/dev/null
 ```
 
-**Check for local clone** (enables much deeper analysis):
+**Check for local clone** (enables much deeper analysis). Match the full
+`owner/repo` slug exactly — substring matches produce false positives
+(`nudge` would match `nudges`, `anti-nudge`, etc.). Don't scan `~` at
+`-maxdepth 3`; it's slow and noisy.
 
 ```bash
-find ~/Projects ~/src ~/code ~/github ~/repos ~/dev ~/workspace ~/Desktop ~ -maxdepth 3 -name .git -type d 2>/dev/null | while read gitdir; do
-  repo_url=$(git -C "$(dirname "$gitdir")" remote get-url origin 2>/dev/null)
-  if echo "$repo_url" | grep -qi "{repo_name}"; then
+target="{owner}/{repo}"
+find ~/Projects ~/src ~/code ~/github ~/repos ~/dev ~/workspace ~/Desktop \
+    -maxdepth 3 -name .git -type d 2>/dev/null | while read gitdir; do
+  slug=$(git -C "$(dirname "$gitdir")" remote get-url origin 2>/dev/null \
+    | sed -E 's|.*[:/]([^/]+/[^/]+?)(\.git)?$|\1|')
+  if [ "$slug" = "$target" ]; then
     echo "LOCAL:$(dirname "$gitdir")"
+    break
   fi
 done
 ```
+
+If no local clone is found in those paths, don't fall back to scanning `~` —
+ask the user where the clone lives (or proceed without one).
 
 If local clone found, also read:
 - TODO/FIXME comments: `grep -r "TODO\|FIXME\|HACK\|XXX" --include="*.{py,js,ts,rs,go,swift}" -l`
@@ -170,6 +215,26 @@ The suggestion MUST:
 - NOT be generic ("add tests", "improve docs", "set up CI", "add a license", "refactor")
 - Show your reasoning — the developer should feel "this advisor actually looked at my project"
 
+**Calibration examples:**
+
+```
+❌ Bad — generic, no evidence:
+   "Add tests to improve coverage and maintainability."
+
+❌ Bad — references the project but still vague:
+   "Your README mentions authentication. You should improve it."
+
+✅ Good — specific, evidence-backed, actionable:
+   "Finish the streaming response handler started in commit a4f21c9
+    (`src/api/stream.ts`) — the route is committed but the handler
+    only returns a stub. Issue #14 from @userX asks for exactly this
+    and has 3 👍 reactions. README §3 lists streaming under
+    'Coming soon'."
+```
+
+A suggestion that could be pasted against any repo unchanged is automatically
+a bad suggestion. Reject it and look deeper.
+
 ### Step 5 — Present suggestion
 
 Format each suggestion like this:
@@ -203,22 +268,50 @@ What do you think?
 
 ### Step 6 — Capture feedback
 
-Whatever the user says, extract actionable preferences and save them:
+Whatever the user says, extract **structured** preferences so Step 4 on the
+next run can read them as hard constraints, not free-form hints. Parse the
+reply into these fields (omit any you can't confidently infer — don't guess):
+
+| Field | Values |
+|---|---|
+| `prefer` | subset of `bug-fix, feature, docs, refactor, performance, ux` |
+| `avoid`  | subset of the same list |
+| `domain_keywords` | ≤ 3 free-form lowercase keywords (`"mobile"`, `"auth"`…) |
+| `rejection_reasons` | subset of `too-vague, out-of-scope, already-done, wrong-priority` (only when the user skipped or tweaked) |
+
+Then merge into `~/.nudge/feedback.json` using the schema below and
+increment the appropriate counter (`accepted`, `skipped`, or `tweaked`):
 
 ```json
 // ~/.nudge/feedback.json
 {
+  "schemaVersion": 1,
+  "excluded": ["owner/abandoned-fork"],
   "repos": {
-    "repo-name": {
-      "preferences": ["prefers bug fixes over features", "cares about mobile UX"],
-      "last_feedback": "2026-04-14",
-      "accepted": 3,
-      "skipped": 1,
-      "tweaked": 1
+    "owner/repo-name": {
+      "preferences": {
+        "prefer": ["bug-fix", "performance"],
+        "avoid": ["docs", "refactor"],
+        "domain_keywords": ["mobile", "offline"],
+        "rejection_reasons": ["too-vague", "out-of-scope"]
+      },
+      "last_feedback": "YYYY-MM-DD",
+      "counters": { "accepted": 3, "skipped": 1, "tweaked": 1 }
     }
   }
 }
 ```
+
+Keys:
+- `excluded` — top-level list of `owner/repo` slugs that should never be
+  suggested (score = -999 in `references/scoring.md`).
+- `repos[slug].preferences.prefer` / `.avoid` — categories the user has
+  explicitly up- or down-weighted. Allowed values: `bug-fix`, `feature`,
+  `docs`, `refactor`, `performance`, `ux`.
+- `repos[slug].preferences.domain_keywords` — up to 3 free-form keywords
+  (e.g. `"mobile"`, `"auth"`).
+- `repos[slug].preferences.rejection_reasons` — one or more of: `too-vague`,
+  `out-of-scope`, `already-done`, `wrong-priority`.
 
 This feedback is read in Step 4 next time. The more the user interacts, the better the advice becomes.
 
@@ -263,9 +356,10 @@ Issue body template:
 ```json
 // ~/.nudge/state.json
 {
+  "schemaVersion": 1,
   "runs": [
     {
-      "timestamp": "2026-04-14T09:03:00Z",
+      "timestamp": "YYYY-MM-DDTHH:MM:SSZ",
       "suggestions": [
         {
           "repo": "owner/repo-name",
@@ -280,6 +374,74 @@ Issue body template:
   ]
 }
 ```
+
+**Write safely.** Both `state.json` and `feedback.json` are rewritten in full
+each time, so a malformed write corrupts the file and kills the next run. To
+avoid that:
+
+1. Read the existing file first and validate it parses as JSON. If parsing
+   fails, back it up to `<file>.corrupt-<timestamp>` and start from the
+   empty seed instead of overwriting blindly.
+2. Write to `<file>.tmp` first, then `mv` it into place — this makes the
+   update atomic so a crash mid-write can never leave a half-written file.
+3. Preserve the `"schemaVersion"` field so future migrations can detect the
+   shape of older files.
+
+```bash
+tmp=$(mktemp "${HOME}/.nudge/state.json.XXXXXX")
+# ... write new JSON to "$tmp" ...
+python3 -m json.tool "$tmp" >/dev/null || { echo "refusing to write malformed JSON"; rm "$tmp"; exit 1; }
+mv "$tmp" ~/.nudge/state.json
+```
+
+---
+
+## Secondary command flows
+
+The commands below are shorter variants that reuse Steps 0–8 above. Each
+flow notes which steps to run and what to skip.
+
+### `/nudge preview {repo?}`
+
+Same as `/nudge` / `/nudge {repo}`, but stop after Step 5 (present the
+suggestion). Do **not** run Step 6 (feedback), Step 7 (post), or Step 8
+(update state). Useful for dry-running advice without creating an issue or
+mutating local files.
+
+### `/nudge status`
+
+Read-only report. Steps:
+
+1. `cat ~/.nudge/state.json` and `cat ~/.nudge/feedback.json`; if either is
+   missing, say so and exit.
+2. Print the last 5 runs from `state.json.runs` with repo, title, estimate,
+   issue URL, and status.
+3. Print per-repo `counters` (accepted / skipped / tweaked) from
+   `feedback.json.repos` sorted by total interactions descending.
+4. List any entries in `feedback.json.excluded`.
+
+Never writes. Never calls `gh api`.
+
+### `/nudge exclude {owner/repo}`
+
+1. Read `~/.nudge/feedback.json` (seed if missing).
+2. Add the slug to the top-level `excluded` array if not already present.
+3. Write the file back using the atomic-write pattern above.
+4. Confirm: `"{owner/repo} excluded. It will score -999 and never be suggested."`
+
+### `/nudge include {owner/repo}`
+
+Inverse of `exclude`. Remove the slug from `excluded` if present and
+confirm. No-op if not in the list.
+
+### `/nudge reset`
+
+Destructive. **Always confirm with the user before running.**
+
+1. Ask: `"This will delete ~/.nudge/state.json and ~/.nudge/feedback.json. Type 'reset' to confirm."`
+2. Only if the user replies exactly `reset`, move (don't delete) both files
+   to `~/.nudge/backup-<timestamp>/` so a mistake is recoverable.
+3. Confirm what was moved and where.
 
 ---
 

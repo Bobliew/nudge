@@ -1,6 +1,8 @@
 # Repo Scoring Algorithm
 
-This is the deterministic scoring algorithm used in Step 2. Apply these rules mechanically — do not use LLM judgment to override scores.
+This is the deterministic scoring algorithm used in Step 1 (scan mode) to rank
+candidate repos before presenting them to the user. Apply these rules
+mechanically — do not use LLM judgment to override scores.
 
 ## Signals and weights
 
@@ -49,4 +51,4 @@ If multiple repos have the same score, prefer:
 
 - If user has < 3 repos total, just score what exists
 - If all repos score negative or zero, output: "All your projects look either very active or very old. No suggestions this week."
-- Repos in the exclusion list (`~/.ai-pm/feedback.json` → `excluded_repos`) get score = -999 (never selected)
+- Repos in the exclusion list (`~/.nudge/feedback.json` → `excluded`) get score = -999 (never selected)

@@ -16,15 +16,13 @@ Not generic "add tests" noise. Each suggestion references specific issues, READM
 
 ## Install
 
-```bash
-claude install-skill https://github.com/Bobliew/nudge
-```
-
-Or manually:
+Clone the skill into your Claude Code skills directory:
 
 ```bash
 git clone https://github.com/Bobliew/nudge.git ~/.claude/skills/nudge
 ```
+
+Then restart Claude Code. The `/nudge` command will be available once the skill is loaded.
 
 ## Prerequisites
 
