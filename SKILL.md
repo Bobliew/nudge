@@ -65,37 +65,32 @@ cat ~/.nudge/state.json 2>/dev/null || echo '{"schemaVersion":1,"runs":[]}'
 cat ~/.nudge/feedback.json 2>/dev/null || echo '{"schemaVersion":1,"repos":{},"excluded":[]}'
 ```
 
-**Score each repo using `references/scoring.md`.** Read that file and apply the
-signals mechanically — recent push window, open community issues, exclusion
-list, and prior-run cooldown. Do not override scores with LLM judgment.
-
-Present the top candidates ranked by score, with the signals that drove the
-score so the user can tell why each appears:
+Drop any repo whose slug is in `feedback.json.excluded`. Then group the
+remaining repos by how much attention they look like they want and show
+each group, so the user has context to choose. Use your judgment about what
+matters most for each repo:
 
 ```
-Your repos (23 total, showing top 5 by score):
+Your repos (23 total):
 
-  1. cli-tool — Rust, pushed 4mo ago  [score: 9]
-     +5 open issue from @userX with no owner reply (#12)
-     +2 in sweet-spot push window (30–180d)
-     +2 3 open issues total
+Recently active (< 3 months):
+  1. my-api — Python, pushed 5 days ago
+  2. web-app — TypeScript, pushed 2 weeks ago
 
-  2. data-viz — Python, pushed 8mo ago  [score: 6]
-     +3 new star in last 30 days
-     +1 in 180d–2y window
-     +2 12 stars, 1 open issue
+Could use attention (3–12 months):
+  3. cli-tool — Rust, 4 months ago, 3 open issues (1 from outside contributor)
+  4. data-viz — Python, 8 months ago, 12 stars
 
-  3. my-api — Python, pushed 5d ago  [score: -5]
-     -5 too recently active; probably doesn't need a nudge
-
-  …
+Hibernating (> 1 year):
+  5. old-project — Go, 14 months ago
 
 Which repo(s) should I look at? (number, name, or "all")
 ```
 
-If all scores are ≤ 0, say so honestly: "All your projects look either very
-active or very old. No strong candidates this week — tell me a specific repo
-and I'll look anyway."
+If a repo has a non-owner open issue with no owner reply, or a recent star
+or fork, call that out next to the line — those are the strongest signals
+that someone is actually waiting for something. But don't rank with
+numbers; let the user decide.
 
 ### Step 2 — Wait for user selection
 
@@ -304,7 +299,7 @@ increment the appropriate counter (`accepted`, `skipped`, or `tweaked`):
 
 Keys:
 - `excluded` — top-level list of `owner/repo` slugs that should never be
-  suggested (score = -999 in `references/scoring.md`).
+  suggested. Step 1 drops these before showing the list.
 - `repos[slug].preferences.prefer` / `.avoid` — categories the user has
   explicitly up- or down-weighted. Allowed values: `bug-fix`, `feature`,
   `docs`, `refactor`, `performance`, `ux`.
@@ -427,7 +422,7 @@ Never writes. Never calls `gh api`.
 1. Read `~/.nudge/feedback.json` (seed if missing).
 2. Add the slug to the top-level `excluded` array if not already present.
 3. Write the file back using the atomic-write pattern above.
-4. Confirm: `"{owner/repo} excluded. It will score -999 and never be suggested."`
+4. Confirm: `"{owner/repo} excluded. It won't appear in /nudge again."`
 
 ### `/nudge include {owner/repo}`
 
